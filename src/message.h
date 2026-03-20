@@ -8,7 +8,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
-#define BUF_SIZE (16*1024*1024)
+#define BUF_SIZE (16*1024*1024) // 16MB, the maximum size of a message (and the maximum size of a single store/load command)
 
 typedef enum { COMPUTE, STORE, LOAD, PSKIP, FORWARD_BEGIN, FORWARD_CONTINUE, REPLY, EOM } command_type_t;
 
@@ -31,12 +31,14 @@ typedef struct {
 typedef struct {
     uint64_t offset;
     uint64_t load_nbytes;
+    uint8_t dev_id; // device id, 0 by default
 } load_opts_t;
 
 typedef struct {
     uint64_t offset;
     uint64_t store_nbytes;
     uint8_t wait_sync;
+    uint8_t dev_id; // device id, 0 by default
 } store_opts_t;
 
 typedef struct {
@@ -49,9 +51,10 @@ typedef struct {
 
 // TODO: Here we need all quantities to be network-ordered
 typedef struct {
-    command_type_t cmd;  
+    command_type_t cmd;
     unsigned char opts[];
 } command_t;
+
 #define cmd_get_opts(type, cmd) ((type*)&((cmd)->opts[0]))
 
 // Data structure containing the data sent by the DistWalk Client

@@ -508,7 +508,7 @@ static struct argp_option argp_client_options[] = {
     { "bind-addr",          BIND_ADDR,              "host[:port]|:port",                          0, "Set client bindname and bindport"},
     { "to",                 TO_OPT_ARG,             "[tcp|udp|ssl:[//]][host][:port]",            0, "Set distwalk target node host, port and protocol"},
     { "num-pkts",           NUM_PKTS,               "n|auto",                                     0, "Number of packets sent by each thread (across all sessions"},
-    { "period",             PERIOD,                 "usec_spec",            0, "Inter-send period for each thread"},
+    { "period",             PERIOD,                 "usec_spec",                                  0, "Inter-send period for each thread"},
     { "rate",               RATE,                   "npkt",                                       0, "Packet sending rate (in pkts per sec)"},
     { "wait-spin",          WAIT_SPIN,               0,                                           0, "Spin-wait till next message send time"},
     { "ws",                 WAIT_SPIN,               0,  OPTION_ALIAS },
@@ -516,9 +516,9 @@ static struct argp_option argp_client_options[] = {
     { "rss",                RATE_STEP_SECS,         "n", OPTION_ALIAS},
     { "comp-time",          COMP_TIME,              "usec_spec",                                  0, "Add a COMPUTE command with the given exec time"},
     { "store-offset",       STORE_OFFSET,           "nbytes_spec",                                0, "Set default file offset for subseq. STOREs"},
-    { "store-data",         STORE_DATA,             "[offset='['nbytes_spec']',][nosync,]size='['nbytes_spec']'", 0, "Add a STORE command with the specified data payload size and optional offset and sync options"},
+    { "store-data",         STORE_DATA,             "[offset='['nbytes_spec']',][nosync,]size='['nbytes_spec']'[,dev=id]", 0, "Add a STORE command with the specified data payload size and optional device, offset and sync options"},
     { "load-offset",        LOAD_OFFSET,            "nbytes_spec",                                0, "Set default file offset for subsequent LOADs"},
-    { "load-data",          LOAD_DATA,              "[offset='['nbytes_spec']',]size='['nbytes_spec']'", 0, "Add a LOAD command with the given data payload size and optional offset"},
+    { "load-data",          LOAD_DATA,              "[offset='['nbytes_spec']',]size='['nbytes_spec']'[,dev=id]", 0, "Add a LOAD command with the given data payload size and optional device and offset options"},
     { "skip",               SKIP_CMD,               "n[,prob=val,every=m]",                       0, "Skip the next n commands with probability val in (0,1.0] (defaults to 1.0), every m requests (defaults to 1)"},
     { "forward",            FORWARD_CMD,            "ip:port[,ip:port,...][,timeout=usec][,retry=n][,nack=n]\n      [,branch]", 0, "Add a FORWARD command to the given ip:port list, specifying optional connection timeout, retries and number of required acks, and whether its a continued/branched multi-forward"},
     { "ps",                 SEND_REQUEST_SIZE,      "nbytes_spec",          0, "Set payload size of sent requests"},
@@ -638,10 +638,11 @@ static error_t argp_client_parse_opt(int key, char *arg, struct argp_state *stat
     case STORE_OFFSET: {
         check(pd_parse_bytes(&store_offset_pd, arg), "Wrong store-offset specification");
         break; }
-    case STORE_DATA: {        
+    case STORE_DATA: { // syntax: --store-data [offset=[nbytes_spec],][nosync,]size=[nbytes_spec][,dev=id]
         pd_spec_t val = pd_build_none();
         pd_spec_t off = store_offset_pd;
         uint8_t sync = 1;
+        uint8_t dev_id = 0; // default device id is 0
         do {
             if (strncmp(arg, "nosync", 6) == 0) {
                 arg += 6;
@@ -659,6 +660,11 @@ static error_t argp_client_parse_opt(int key, char *arg, struct argp_state *stat
                 char *tok = strsep(&arg, "]");
                 check(arg != NULL, "Missing closing ] bracket in %s", arg);
                 check(pd_parse_bytes(&val, tok), "Wrong store size specification");
+            } else if (strncmp(arg, "dev=", 4) == 0) {
+                arg += 4;
+                char *tok = strsep(&arg, ","); // check for bugs
+                dev_id = atoi(tok);
+                check((dev_id > 0), "Device id in dev= needs to be a positive integer");
             } else {
                 check(pd_parse_bytes(&val, arg), "Wrong store data size specification");
                 break;
@@ -670,10 +676,12 @@ static error_t argp_client_parse_opt(int key, char *arg, struct argp_state *stat
         ccmd_add(ccmd, STORE, &val);
         ccmd_last(ccmd)->pd_val2 = off;
         ccmd_last(ccmd)->store.wait_sync = sync;
+        ccmd_last(ccmd)->store.dev_id = dev_id;
         break; }
-    case LOAD_DATA: {
+    case LOAD_DATA: { // syntax: --load-data [offset=[nbytes_spec],]size=[nbytes_spec][,dev=id]
         pd_spec_t val = pd_build_none();
         pd_spec_t off = load_offset_pd;
+        uint8_t dev_id = 0; // default device id is 0
         do {
             if (strncmp(arg, "size=[", 6) == 0) {
                 arg += 6;
@@ -685,6 +693,11 @@ static error_t argp_client_parse_opt(int key, char *arg, struct argp_state *stat
                 char *tok = strsep(&arg, "]");
                 check(arg != NULL, "Missing closing ] bracket in %s", arg);
                 check(pd_parse_bytes(&off, tok), "Wrong load offset specification");
+            } else if (strncmp(arg, "dev=", 4) == 0) {
+                arg += 4;
+                char *tok = strsep(&arg, ","); // check for bugs
+                dev_id = atoi(tok);
+                check((dev_id > 0), "Device id in dev= needs to be a positive integer");
             } else {
                 dw_log("ARG: %s\n", arg);
                 check(pd_parse_bytes(&val, arg), "Wrong load size specification");
@@ -696,6 +709,7 @@ static error_t argp_client_parse_opt(int key, char *arg, struct argp_state *stat
         check(!pd_is_none(&val), "Wrong load data size specification");
         ccmd_add(ccmd, LOAD, &val);
         ccmd_last(ccmd)->pd_val2 = off;
+        ccmd_last(ccmd)->load.dev_id = dev_id;
         break; }
     case SKIP_CMD: {
         pd_spec_t val = pd_build_fixed(1.0);
