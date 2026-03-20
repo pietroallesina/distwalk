@@ -114,8 +114,8 @@ typedef struct {
     int dispatchfd[2];
 
     // communication with storage
-    int storefd; // write
-    int store_replyfd; // read
+    int storefd[MAX_STORAGE_DEVICES]; // write
+    int store_replyfd[MAX_STORAGE_DEVICES]; // read
 
     int worker_id;
     int core_id; // core pinning
@@ -147,6 +147,7 @@ typedef struct {
     int store_replyfd[MAX_THREADS]; //write
 
     pqueue_t* sync_waiting_queue; // worker threads waiting for periodic timer to be triggered
+    int worker_id;
     int core_id; // core pinning
 
     storage_info_t storage_info;
@@ -163,23 +164,24 @@ typedef struct {
     };
 } storage_req_t;
 
+// connection workers
+int conn_threads = 1;
 pthread_t workers[MAX_THREADS];
 conn_worker_info_t conn_worker_infos[MAX_THREADS];
 
-// Pipe comm
-int fds[MAX_THREADS][2];
-int fds2[MAX_THREADS][2];
-
+// storage workers
 bool parse_storage = false;
-
-// Use one storage thread per storage device
+int storage_threads = 0;
+int storage_threads_custom = 0;
 pthread_t storers[MAX_STORAGE_DEVICES];
 storage_worker_info_t storage_worker_info[MAX_STORAGE_DEVICES];
 
+// Pipe communication
+int fds[MAX_THREADS][MAX_STORAGE_DEVICES][2];
+int fds2[MAX_THREADS][MAX_STORAGE_DEVICES][2];
+
 //pthread_mutex_t socks_mtx;
 
-int conn_threads = 1;
-int storage_threads = 0;
 int no_delay = 1;
 atomic_int next_thread_cnt = 0;
 int use_wait_spinning = 0;
@@ -733,6 +735,8 @@ int process_single_message(req_info_t *req, dw_poll_t *p_poll, conn_worker_info_
             }
             // any further cmds[] for replied-to hop, not me
             return 1;
+
+        // TODO: update
         case STORE:
         case LOAD: {
             storage_req_t w = { .worker_id = infos->worker_id, .req_id = req->req_id };
@@ -884,6 +888,7 @@ void handle_timeout(dw_poll_t *p_poll, conn_worker_info_t *infos) {
     }
 }
 
+// TODO: probably needs updating
 void exec_request(dw_poll_t *p_poll, dw_poll_flags pflags, int conn_id, event_t type, conn_worker_info_t* infos) {
     conn_info_t *conn = conn_get_by_id(conn_id);
     dw_log("event_type=%s, conn_id=%d\n", get_event_str(type), conn_id);
@@ -1005,7 +1010,7 @@ void* storage_worker(void* args) {
     storage_worker_info_t *infos = (storage_worker_info_t *)args;
     infos->sync_waiting_queue = pqueue_alloc(MAX_REQS);
 
-    sprintf(thread_name, "storagew");
+    sprintf(thread_name, "storagew-%d", infos->worker_id);
     sys_check(prctl(PR_SET_NAME, thread_name, NULL, NULL, NULL));
 
     if (infos->core_id >= 0) {
@@ -1177,8 +1182,10 @@ void* conn_worker(void* args) {
         check(dw_poll_add(&infos->dw_poll, infos->statfd, DW_POLLIN, i2l(STATS, infos->statfd)) == 0);
 
     // Add storage reply fd
-    if (infos->storefd != -1)
-        check(dw_poll_add(&infos->dw_poll, infos->store_replyfd, DW_POLLIN, i2l(STORAGE, infos->store_replyfd)) == 0);
+    for (int i = 0; i < storage_threads; i++) {
+         if (infos->storefd[i] != -1)
+            check(dw_poll_add(&infos->dw_poll, infos->store_replyfd[i], DW_POLLIN, i2l(STORAGE, infos->store_replyfd[i])) == 0);
+    }
 
     // Add parent communication fd
     if (accept_mode == AM_PARENT) {
@@ -1344,6 +1351,7 @@ enum argp_node_option_keys {
     THREAD_AFFINITY = 'c',
     NUM_THREADS = 0x101,
     SCHED_POLICY = 0x102,
+    STORAGE_DEVICES = 0x103,
     SYNC,
     ODIRECT,
     NO_DEFRAG,
@@ -1380,35 +1388,37 @@ struct argp_node_arguments {
 
 static struct argp_option argp_node_options[] = {
     // long name, short name, value name, flag, description
-    {"bind-addr",         BIND_ADDR,        "[tcp|udp|ssl:[//]][host][:port]",0,  "DistWalk node bindname, bindport, and communication protocol (can be specified multiple times)"},
-    {"accept-mode",       ACCEPT_MODE,      "child|shared|parent",            0,  "Accept mode (per-worker thread, shared or parent-only listening queue)"},
-    {"poll-mode",         POLL_MODE,        "epoll|poll|select",              0,  "Poll mode (defaults to epoll)"},
-    {"backlog-length",    BACKLOG_LENGTH,   "n",                              0,  "Maximum pending connections queue length"},
-    {"bl",                BACKLOG_LENGTH,   "n", OPTION_ALIAS},
-    {"storage",           STORAGE_OPT_ARG,  "[file=]/path/to/file[,size=nbytes][,sync=msecs][,odirect][,wait-spin]",  0,  "Path to the file used for storage"},
-    {"max-storage-size",  MAX_STORAGE_SIZE, "nbytes",                         0,  "Max size for the storage size"},
-    {"nt",                NUM_THREADS,      "n",                              0,  "Number of threads dedicated to communication" },
-    {"num-threads",       NUM_THREADS,      "n", OPTION_ALIAS},
-    {"sync",              SYNC,             "msec",                           0,  "Periodically sync the written data on disk" },
-    {"odirect",           ODIRECT,           0,                               0,  "Enable direct disk access (bypass read/write OS caches)"},
-    {"thread-affinity",   THREAD_AFFINITY,  "auto|cX,cZ[,cA-cD[:step]]",      0,  "Thread-to-core pinning (automatic or user-defined list using taskset syntax)"},
-    {"sched-policy",      SCHED_POLICY,     "other[:nice]|rr:rtprio|fifo:rtprio|dl:runtime_us,dline_us", 0,  "Scheduling policy (defaults to other)"},
-    {"no-delay",          NO_DELAY,         "0|1",                            0,  "Set value of TCP_NODELAY socket option"},
-    {"nd",                NO_DELAY,         "0|1", OPTION_ALIAS },
-    {"no-defrag",         NO_DEFRAG,         0,                               0,  "Disable defragmentation of connection buffers for incoming messages (defaults to defrag enabled)"},
-    {"wait-spin",         WAIT_SPIN,         0,                               0,  "Spin-wait instead of sleeping till next received packet"},
-    {"ws",                WAIT_SPIN,         0, OPTION_ALIAS },
-    {"wait-spin-storage", WAIT_SPIN_STORAGE, 0,                               0,  "Spin-wait for storage thread (default: storage thread blocks)"},
-    {"wss",               WAIT_SPIN_STORAGE, 0, OPTION_ALIAS },
-    {"loops-per-usec",    LOOPS_PER_USEC,    "value",                         0,  "Set loops_per_usec calibration parameter (0: handle it automatically in ~/.dw_loops_per_usec; -1: use frequency-invariant mode)"},
-    {"help",              HELP,              0,                               0,  "Show this help message", 1 },
-    {"usage",             USAGE,             0,                               0,  "Show a short usage message", 1 },
-    {"ssl-cert",          SSL_CERT_FILE,     "FILE",                          0,  "Server SSL certificate file" },
-    {"ssl-key",           SSL_KEY_FILE,      "FILE",                          0,  "Server SSL key file" },
-    {"ssl-ca",            SSL_CA_FILE,       "FILE",                          0,  "Server SSL CA file" },
-    {"ssl-ciphers",       SSL_CIPHERS,       "CIPHERS",                       0,  "Allowed SSL ciphers" },
-    {"ssl-ca-path",       SSL_CA_PATH,       "DIR",                           0,  "Server SSL CA path" },
-    {"ssl-verify",        SSL_VERIFY,        0,                               0,  "Enable peer certificate verification"},
+    {"bind-addr",           BIND_ADDR,          "[tcp|udp|ssl:[//]][host][:port]",  0,  "DistWalk node bindname, bindport, and communication protocol (can be specified multiple times)"},
+    {"accept-mode",         ACCEPT_MODE,        "child|shared|parent",              0,  "Accept mode (per-worker thread, shared or parent-only listening queue)"},
+    {"poll-mode",           POLL_MODE,          "epoll|poll|select",                0,  "Poll mode (defaults to epoll)"},
+    {"bl",                  BACKLOG_LENGTH,     "n",                                0,  "Maximum pending connections queue length"},
+    {"backlog-length",      BACKLOG_LENGTH,     "n", OPTION_ALIAS},
+    {"ns",                  STORAGE_DEVICES,    "n",                                0,  "Number of storage devices" },
+    {"num-storers",         STORAGE_DEVICES,    "n", OPTION_ALIAS },
+    {"storage",             STORAGE_OPT_ARG,    "[file=]/path/to/file[,size=nbytes][,sync=msecs][,odirect][,wait-spin]", 0,  "Path to the file used for storage"},
+    {"max-storage-size",    MAX_STORAGE_SIZE,   "nbytes",                           0,  "Max size for the storage size"},
+    {"nt",                  NUM_THREADS,        "n",                                0,  "Number of threads dedicated to communication" },
+    {"num-threads",         NUM_THREADS,        "n", OPTION_ALIAS},
+    {"sync",                SYNC,               "msec",                             0,  "Periodically sync the written data on disk" },
+    {"odirect",             ODIRECT,            0,                                  0,  "Enable direct disk access (bypass read/write OS caches)"},
+    {"thread-affinity",     THREAD_AFFINITY,    "auto|cX,cZ[,cA-cD[:step]]",        0,  "Thread-to-core pinning (automatic or user-defined list using taskset syntax)"},
+    {"sched-policy",        SCHED_POLICY,       "other[:nice]|rr:rtprio|fifo:rtprio|dl:runtime_us,dline_us", 0,  "Scheduling policy (defaults to other)"},
+    {"nd",                  NO_DELAY,           "0|1",                              0,  "Set value of TCP_NODELAY socket option"},
+    {"no-delay",            NO_DELAY,           "0|1", OPTION_ALIAS },
+    {"no-defrag",           NO_DEFRAG,          0,                                  0,  "Disable defragmentation of connection buffers for incoming messages (defaults to defrag enabled)"},
+    {"ws",                  WAIT_SPIN,          0,                                  0,  "Spin-wait instead of sleeping till next received packet"},
+    {"wait-spin",           WAIT_SPIN,          0, OPTION_ALIAS },
+    {"wss",                 WAIT_SPIN_STORAGE,  0,                                  0,  "Spin-wait for storage thread (default: storage thread blocks)"},
+    {"wait-spin-storage",   WAIT_SPIN_STORAGE,  0, OPTION_ALIAS },
+    {"loops-per-usec",      LOOPS_PER_USEC,     "value",                            0,  "Set loops_per_usec calibration parameter (0: handle it automatically in ~/.dw_loops_per_usec; -1: use frequency-invariant mode)"},
+    {"help",                HELP,               0,                                  0,  "Show this help message", 1 },
+    {"usage",               USAGE,              0,                                  0,  "Show a short usage message", 1 },
+    {"ssl-cert",            SSL_CERT_FILE,      "FILE",                             0,  "Server SSL certificate file" },
+    {"ssl-key",             SSL_KEY_FILE,       "FILE",                             0,  "Server SSL key file" },
+    {"ssl-ca",              SSL_CA_FILE,        "FILE",                             0,  "Server SSL CA file" },
+    {"ssl-ciphers",         SSL_CIPHERS,        "CIPHERS",                          0,  "Allowed SSL ciphers" },
+    {"ssl-ca-path",         SSL_CA_PATH,        "DIR",                              0,  "Server SSL CA path" },
+    {"ssl-verify",          SSL_VERIFY,         0,                                  0,  "Enable peer certificate verification"},
     { 0 }
 };
 
@@ -1478,6 +1488,13 @@ static error_t argp_node_parse_opt(int key, char *arg, struct argp_state *state)
         loops_per_usec = atof(arg);
         check(loops_per_usec == -1 || loops_per_usec >= 0);
         break;
+    case STORAGE_DEVICES:
+        storage_threads = atoi(arg);
+        if (storage_threads < 0 || storage_threads > MAX_STORAGE_DEVICES) {
+            printf("Invalid number of storage threads: %d\n", storage_threads);
+            exit(EXIT_FAILURE);
+        }
+        break;
     case MAX_STORAGE_SIZE:
         arguments->max_storage_size = atol(arg);
         break;
@@ -1491,22 +1508,25 @@ static error_t argp_node_parse_opt(int key, char *arg, struct argp_state *state)
         arguments->use_wait_spin_storage = 1;
         break;
     case STORAGE_OPT_ARG: // syntax: --storage [file=]/path/to/file[,size=nbytes][,sync=msecs][,odirect][,wait-spin]
-        if (!parse_storage)
+        if (!parse_storage) {
+            storage_threads_custom++;
             break;
+        }
 
-        if (storage_threads >= MAX_STORAGE_DEVICES) {
+        if (storage_threads_custom >= MAX_STORAGE_DEVICES) {
             printf("Too many --storage options\n");
             exit(EXIT_FAILURE);
         }
 
+        storage_worker_info_t *sw_info = &storage_worker_info[storage_threads_custom];
         char *tok = strsep(&arg, ","); // if no comma, arg will be set to NULL, which is fine since we are done parsing
 
         if (strncmp(tok, "file=", 5) == 0) {
             tok += 5;
         }
         if (*tok == '/') {
-            strncpy(storage_worker_info[storage_threads].storage_info.storage_path, tok, MAX_STORAGE_PATH_STR);
-            storage_worker_info[storage_threads].storage_info.storage_path[MAX_STORAGE_PATH_STR-1] = '\0';
+            strncpy(sw_info->storage_info.storage_path, tok, MAX_STORAGE_PATH_STR);
+            sw_info->storage_info.storage_path[MAX_STORAGE_PATH_STR-1] = '\0';
         } else {
             printf("Invalid --storage argument (should start with 'file=' or be an absolute path): %s\n", arg);
             exit(EXIT_FAILURE);
@@ -1515,23 +1535,23 @@ static error_t argp_node_parse_opt(int key, char *arg, struct argp_state *state)
         while (arg != NULL && *arg != '\0') {
             char *tok = strsep(&arg, ",");
             if (strncmp(tok, "size=", 5) == 0) {
-                storage_worker_info[storage_threads].storage_info.max_storage_size = atol(tok + 5);
+                sw_info->storage_info.max_storage_size = atol(tok + 5);
                 continue;
             }
             if (strncmp(tok, "sync=", 5) == 0) {
-                storage_worker_info[storage_threads].periodic_sync_msec = atoi(tok + 5);
+                sw_info->periodic_sync_msec = atoi(tok + 5);
                 continue;
             }
             if (strncmp(tok, "odirect", 7) == 0) {
-                storage_worker_info[storage_threads].storage_info.use_odirect = 1;
+                sw_info->storage_info.use_odirect = 1;
                 continue;
             }
             if (strncmp(tok, "wait-spin", 9) == 0) {
-                storage_worker_info[storage_threads].use_wait_spin = 1;
+                sw_info->use_wait_spin = 1;
                 continue;
             }
         }
-        storage_threads++;
+        storage_threads_custom++;
         break;
     case NUM_THREADS:
         arguments->num_threads = atoi(arg);
@@ -1660,10 +1680,22 @@ int main(int argc, char *argv[]) {
     input_args.ssl_ca_path = NULL;
     input_args.ssl_verify = 0;
 
+    // First pass of argp parsing to set defaults for storage workers (can be overridden by --storage options in the second pass)
     argp_parse(&argp, argc, argv, ARGP_NO_HELP, 0, &input_args);
+
+    if (storage_threads == 0) {
+        if (storage_threads_custom > 0) {
+            storage_threads = storage_threads_custom;
+        } else {
+            storage_threads = 1;
+        }
+    } else {
+        check(storage_threads_custom <= storage_threads, "Cannot specify more --storage options than the number of storage threads specified with --storage-devices");
+    }
 
     // Set defaults for storage
     for (int i = 0; i < storage_threads; i++) {
+
         storage_worker_info_t *sw_info = &storage_worker_info[i];
         sw_info->timerfd = -1;
         sw_info->periodic_sync_msec = input_args.periodic_sync_msec;
@@ -1673,14 +1705,13 @@ int main(int argc, char *argv[]) {
         s_info->storage_fd = -1;
         char *home_path = getenv("HOME");
         check(home_path != NULL && strlen(home_path) + 20 < sizeof(*s_info));
-        sprintf(s_info->storage_path, "%s/.dw_store_%d", home_path, i);
+        snprintf(s_info->storage_path, MAX_STORAGE_PATH_STR, "%s/.dw_store_%d", home_path, i);
         s_info->use_odirect = input_args.use_odirect;
         s_info->max_storage_size = input_args.max_storage_size;
         s_info->storage_offset = 0;
         s_info->storage_eof = 0;
     }
 
-    storage_threads = 0; // will be updated by argp parsing, which can specify multiple --storage options
     parse_storage = 1; // allow parsing of --storage options only after the default storage path has been set (can be overridden by --storage)
     argp_parse(&argp, argc, argv, ARGP_NO_HELP, 0, &input_args);
     parse_storage = 0;
@@ -1786,47 +1817,57 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Open storage file, if any 
-    if (storage_worker_info.storage_info.storage_path[0] != '\0') {
-        int flags = O_RDWR | O_CREAT | O_TRUNC;
-        if (storage_worker_info.storage_info.use_odirect)
-            flags |= O_DIRECT;
-        sys_check(storage_worker_info.storage_info.storage_fd = open(storage_worker_info.storage_info.storage_path, flags, S_IRUSR | S_IWUSR));
-        sys_check(fallocate(storage_worker_info.storage_info.storage_fd, 0, 0, BUF_SIZE));
+    // Initialize storage_worker_infos and pipes between connection and storage workers
+    for (int i = 0; i < storage_threads; i++) {
 
-        struct stat s;
-        sys_check(fstat(storage_worker_info.storage_info.storage_fd, &s));
-        blk_size = s.st_blksize;
-        dw_log("blk_size = %lu\n", blk_size);
+        storage_worker_info_t *sw_info = &storage_worker_info[i];
+        sw_info->worker_id = i;
 
-        if (storage_worker_info.storage_info.use_odirect) { // block-aligned buffer
-            sys_check(posix_memalign((void**) &storage_worker_info.store_buf, blk_size, BUF_SIZE));
+        if (sw_info->storage_info.storage_path[0] != '\0') {
+            int flags = O_RDWR | O_CREAT | O_TRUNC;
+            if (sw_info->storage_info.use_odirect)
+                flags |= O_DIRECT;
+            sys_check(sw_info->storage_info.storage_fd = open(sw_info->storage_info.storage_path, flags, S_IRUSR | S_IWUSR));
+            sys_check(fallocate(sw_info->storage_info.storage_fd, 0, 0, BUF_SIZE));
+
+            struct stat s;
+            sys_check(fstat(sw_info->storage_info.storage_fd, &s));
+            blk_size = s.st_blksize;
+            dw_log("blk_size = %lu\n", blk_size);
+
+            if (sw_info->storage_info.use_odirect) { // block-aligned buffer
+                sys_check(posix_memalign((void**) &sw_info->store_buf, blk_size, BUF_SIZE));
+            } else {
+                sw_info->store_buf = calloc(1, BUF_SIZE);
+            }
+
+            for (int j = 0; j < input_args.num_threads; j++) {
+
+                conn_worker_info_t *cw_info = &conn_worker_infos[j];
+
+                // conn_worker -> storage_worker
+                if (pipe(fds[j][i]) == -1) {
+                   perror("pipe");
+                   exit(EXIT_FAILURE);
+                }
+                sw_info->storefd[j] = fds[j][i][0]; // read
+                cw_info->storefd[i] = fds[j][i][1]; // write
+
+                // storage_worker -> conn_worker
+                if (pipe(fds2[j][i]) == -1) {
+                   perror("pipe");
+                   exit(EXIT_FAILURE);
+                }
+                sw_info->store_replyfd[j] = fds2[j][i][1]; // write
+                cw_info->store_replyfd[i] = fds2[j][i][0]; // read
+            }
+
         } else {
-            storage_worker_info.store_buf = calloc(1, BUF_SIZE);
-        }
-        for (int i = 0; i < input_args.num_threads; i++) {
-            // conn_worker -> storage_worker
-            if (pipe(fds[i]) == -1) {
-               perror("pipe");
-               exit(EXIT_FAILURE);
+            for (int j = 0; j < input_args.num_threads; j++) {
+                conn_worker_info_t *cw_info = &conn_worker_infos[j];
+                cw_info->storefd[i] = -1;
+                cw_info->store_replyfd[i] = -1;
             }
-
-            storage_worker_info.storefd[i] = fds[i][0]; // read
-            conn_worker_infos[i].storefd = fds[i][1]; // write
-
-            // storage_worker -> conn_worker
-            if (pipe(fds2[i]) == -1) {
-               perror("pipe");
-               exit(EXIT_FAILURE);
-            }
-
-            storage_worker_info.store_replyfd[i] = fds2[i][1]; // write 
-            conn_worker_infos[i].store_replyfd = fds2[i][0]; // read
-        }
-    } else {
-        for (int i = 0; i < input_args.num_threads; i++) {
-            conn_worker_infos[i].storefd = -1;
-            conn_worker_infos[i].store_replyfd = -1;
         }
     }
 
@@ -1925,15 +1966,19 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Init storage thread
-    if (storage_worker_info.storage_info.storage_path[0] != '\0') {
-        if (input_args.use_thread_affinity) {
-            storage_worker_info.core_id = core_it;
-            aff_it_next(&core_it, &mask, nproc);
-        } else {
-            storage_worker_info.core_id = -1;
+    // Run storage threads
+    for (int i = 0; i < storage_threads; i++) {
+        storage_worker_info_t *sw_info = &storage_worker_info[i];
+
+        if (sw_info->storage_info.storage_path[0] != '\0') {
+            if (input_args.use_thread_affinity) {
+                sw_info->core_id = core_it;
+                aff_it_next(&core_it, &mask, nproc);
+            } else {
+                sw_info->core_id = -1;
+            }
+            sys_check(pthread_create(&storers[i], NULL, storage_worker, (void *)sw_info));
         }
-        sys_check(pthread_create(&storer, NULL, storage_worker, (void *)&storage_worker_info));
     }
 
     // Run
@@ -1945,7 +1990,7 @@ int main(int argc, char *argv[]) {
             sys_check(pthread_create(&workers[i], NULL, conn_worker, (void *)&conn_worker_infos[i]));
         }
     }
-    
+
     // Clean-ups
     if (input_args.num_threads > 1) {
         // Join worker threads
@@ -1959,28 +2004,36 @@ int main(int argc, char *argv[]) {
         pqueue_free(conn_worker_infos[0].timeout_queue);
     }
 
-    if (storage_worker_info.storage_info.storage_path[0] != '\0') {
-        sys_check(pthread_join(storer, NULL));
-        pqueue_free(storage_worker_info.sync_waiting_queue);
-        free(storage_worker_info.store_buf);
+    for (int i = 0; i < storage_threads; i++) {
+        storage_worker_info_t *sw_info = &storage_worker_info[i];
+
+        if (sw_info->storage_info.storage_path[0] != '\0') {
+            sys_check(pthread_join(storers[i], NULL));
+            pqueue_free(sw_info->sync_waiting_queue);
+            free(sw_info->store_buf);
+        }
     }
 
     // close terminationfd
     close(terminationfd);
 
     // termination clean-ups
-    if (storage_worker_info.storage_info.storage_fd >= 0) {
-        close(storage_worker_info.storage_info.storage_fd);
+    for (int i = 0; i < storage_threads; i++) {
+        storage_worker_info_t *sw_info = &storage_worker_info[i];
 
-        for (int i = 0; i < input_args.num_threads; i++) {
-            close(conn_worker_infos[i].storefd);
-            close(storage_worker_info.storefd[i]);
+        if (sw_info->storage_info.storage_fd >= 0) {
+            close(sw_info->storage_info.storage_fd);
 
-            close(conn_worker_infos[i].store_replyfd);
-            close(storage_worker_info.store_replyfd[i]);
+            for (int j = 0; j < input_args.num_threads; j++) {
+                close(conn_worker_infos[j].storefd[i]);
+                close(sw_info->storefd[j]);
 
-            close(conn_worker_infos[i].dispatchfd[0]);
-            close(conn_worker_infos[i].dispatchfd[1]);
+                close(conn_worker_infos[j].store_replyfd[i]);
+                close(sw_info->store_replyfd[j]);
+
+                close(conn_worker_infos[j].dispatchfd[0]);
+                close(conn_worker_infos[j].dispatchfd[1]);
+            }
         }
     }
 
