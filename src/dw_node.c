@@ -85,6 +85,7 @@ const char* get_event_str(event_t event) {
 
 // used with --per-client-thread
 #define MAX_THREADS 256
+#define MAX_STORAGE_DEVICES 16
 #define MAX_STORAGE_PATH_STR 100
 
 #define MAX_LISTEN_SOCKETS 16
@@ -139,6 +140,7 @@ typedef struct {
 typedef struct {
     int timerfd; // special timerfd to handle periodic storage sync
     int periodic_sync_msec;
+    int use_wait_spin;
 
     // communication with conn worker
     int storefd[MAX_THREADS]; // read
@@ -168,16 +170,19 @@ conn_worker_info_t conn_worker_infos[MAX_THREADS];
 int fds[MAX_THREADS][2];
 int fds2[MAX_THREADS][2];
 
-pthread_t storer;
-storage_worker_info_t storage_worker_info;
+bool parse_storage = false;
+
+// Use one storage thread per storage device
+pthread_t storers[MAX_STORAGE_DEVICES];
+storage_worker_info_t storage_worker_info[MAX_STORAGE_DEVICES];
 
 //pthread_mutex_t socks_mtx;
 
 int conn_threads = 1;
+int storage_threads = 0;
 int no_delay = 1;
 atomic_int next_thread_cnt = 0;
 int use_wait_spinning = 0;
-int use_wait_spinning_storage = 0;
 int enable_defrag = 1;
 
 typedef enum { AM_CHILD, AM_SHARED, AM_PARENT } accept_mode_t;
@@ -1010,7 +1015,7 @@ void* storage_worker(void* args) {
 
     dw_poll_t poll, *p_poll = &poll;
 
-    check(dw_poll_init(p_poll, poll_mode, use_wait_spinning_storage) == 0);
+    check(dw_poll_init(p_poll, poll_mode, infos->use_wait_spin) == 0);
 
     // Add conn_worker(s) -> storage_worker communication pipe
     for (int i = 0; i < conn_threads; i++) {
@@ -1359,6 +1364,8 @@ struct argp_node_arguments {
     int periodic_sync_msec;
     size_t max_storage_size;
     int use_odirect;
+    int use_wait_spin_storage;
+
     int use_thread_affinity;
     char* thread_affinity_list;
     int num_threads;
@@ -1378,10 +1385,10 @@ static struct argp_option argp_node_options[] = {
     {"poll-mode",         POLL_MODE,        "epoll|poll|select",              0,  "Poll mode (defaults to epoll)"},
     {"backlog-length",    BACKLOG_LENGTH,   "n",                              0,  "Maximum pending connections queue length"},
     {"bl",                BACKLOG_LENGTH,   "n", OPTION_ALIAS},
-    {"storage",           STORAGE_OPT_ARG,  "path/to/storage/file",           0,  "Path to the file used for storage"},
+    {"storage",           STORAGE_OPT_ARG,  "[file=]/path/to/file[,size=nbytes][,sync=msecs][,odirect][,wait-spin]",  0,  "Path to the file used for storage"},
     {"max-storage-size",  MAX_STORAGE_SIZE, "nbytes",                         0,  "Max size for the storage size"},
     {"nt",                NUM_THREADS,      "n",                              0,  "Number of threads dedicated to communication" },
-    {"num-threads",       NUM_THREADS,      "n", OPTION_ALIAS },
+    {"num-threads",       NUM_THREADS,      "n", OPTION_ALIAS},
     {"sync",              SYNC,             "msec",                           0,  "Periodically sync the written data on disk" },
     {"odirect",           ODIRECT,           0,                               0,  "Enable direct disk access (bypass read/write OS caches)"},
     {"thread-affinity",   THREAD_AFFINITY,  "auto|cX,cZ[,cA-cD[:step]]",      0,  "Thread-to-core pinning (automatic or user-defined list using taskset syntax)"},
@@ -1409,6 +1416,11 @@ static error_t argp_node_parse_opt(int key, char *arg, struct argp_state *state)
     /* Get the input argument from argp_parse, which we
         know is a pointer to our arguments structure. */
     struct argp_node_arguments *arguments = state->input;
+
+    // Bypass other options when looking for --storage
+    if (parse_storage && key != STORAGE_OPT_ARG) {
+        return 0;
+    }
 
     switch(key) {
     case HELP:
@@ -1462,31 +1474,67 @@ static error_t argp_node_parse_opt(int key, char *arg, struct argp_state *state)
     case WAIT_SPIN:
         use_wait_spinning = 1;
         break;
-    case WAIT_SPIN_STORAGE:
-        use_wait_spinning_storage = 1;
-        break;
     case LOOPS_PER_USEC:
         loops_per_usec = atof(arg);
         check(loops_per_usec == -1 || loops_per_usec >= 0);
         break;
-    case STORAGE_OPT_ARG:
-        if (strlen(arg) >= MAX_STORAGE_PATH_STR) {
-            printf("storage_path too long: %s\n", arg);
-            exit(EXIT_FAILURE);
-        }
-        strcpy(storage_worker_info.storage_info.storage_path, arg);
+    case MAX_STORAGE_SIZE:
+        arguments->max_storage_size = atol(arg);
         break;
     case SYNC:
         arguments->periodic_sync_msec = atoi(arg);
         break;
-    case MAX_STORAGE_SIZE:
-        arguments->max_storage_size = atol(arg);
+    case ODIRECT:
+        arguments->use_odirect = 1;
+        break;
+    case WAIT_SPIN_STORAGE:
+        arguments->use_wait_spin_storage = 1;
+        break;
+    case STORAGE_OPT_ARG: // syntax: --storage [file=]/path/to/file[,size=nbytes][,sync=msecs][,odirect][,wait-spin]
+        if (!parse_storage)
+            break;
+
+        if (storage_threads >= MAX_STORAGE_DEVICES) {
+            printf("Too many --storage options\n");
+            exit(EXIT_FAILURE);
+        }
+
+        char *tok = strsep(&arg, ","); // if no comma, arg will be set to NULL, which is fine since we are done parsing
+
+        if (strncmp(tok, "file=", 5) == 0) {
+            tok += 5;
+        }
+        if (*tok == '/') {
+            strncpy(storage_worker_info[storage_threads].storage_info.storage_path, tok, MAX_STORAGE_PATH_STR);
+            storage_worker_info[storage_threads].storage_info.storage_path[MAX_STORAGE_PATH_STR-1] = '\0';
+        } else {
+            printf("Invalid --storage argument (should start with 'file=' or be an absolute path): %s\n", arg);
+            exit(EXIT_FAILURE);
+        }
+
+        while (arg != NULL && *arg != '\0') {
+            char *tok = strsep(&arg, ",");
+            if (strncmp(tok, "size=", 5) == 0) {
+                storage_worker_info[storage_threads].storage_info.max_storage_size = atol(tok + 5);
+                continue;
+            }
+            if (strncmp(tok, "sync=", 5) == 0) {
+                storage_worker_info[storage_threads].periodic_sync_msec = atoi(tok + 5);
+                continue;
+            }
+            if (strncmp(tok, "odirect", 7) == 0) {
+                storage_worker_info[storage_threads].storage_info.use_odirect = 1;
+                continue;
+            }
+            if (strncmp(tok, "wait-spin", 9) == 0) {
+                storage_worker_info[storage_threads].use_wait_spin = 1;
+                continue;
+            }
+        }
+        storage_threads++;
         break;
     case NUM_THREADS:
         arguments->num_threads = atoi(arg);
-        break;
-    case ODIRECT:
-        arguments->use_odirect = 1;
         break;
     case THREAD_AFFINITY:
         arguments->use_thread_affinity = 1;
@@ -1594,12 +1642,13 @@ void init_listen_sock(int i, accept_mode_t accept_mode, proto_t proto, struct so
 
 int main(int argc, char *argv[]) {
     static struct argp argp = { argp_node_options, argp_node_parse_opt, 0, "Distwalk Node -- the server program" };
+
     struct argp_node_arguments input_args;
-    
     // Default argp values
     input_args.periodic_sync_msec = -1;
     input_args.max_storage_size = 1024 * 1024 * 1024;
     input_args.use_odirect = 0;
+    input_args.use_wait_spin_storage = 0;
     input_args.use_thread_affinity = 0;
     input_args.thread_affinity_list = NULL;    
     input_args.num_threads = 1;
@@ -1611,14 +1660,31 @@ int main(int argc, char *argv[]) {
     input_args.ssl_ca_path = NULL;
     input_args.ssl_verify = 0;
 
-    char *home_path = getenv("HOME");
-    check(home_path != NULL && strlen(home_path) + 10 < sizeof(storage_worker_info.storage_info));
-    strcpy(storage_worker_info.storage_info.storage_path, home_path);
-    strcat(storage_worker_info.storage_info.storage_path, "/.dw_store");
-    storage_worker_info.storage_info.storage_fd = -1;
-
     argp_parse(&argp, argc, argv, ARGP_NO_HELP, 0, &input_args);
-    
+
+    // Set defaults for storage
+    for (int i = 0; i < storage_threads; i++) {
+        storage_worker_info_t *sw_info = &storage_worker_info[i];
+        sw_info->timerfd = -1;
+        sw_info->periodic_sync_msec = input_args.periodic_sync_msec;
+        sw_info->use_wait_spin = input_args.use_wait_spin_storage;
+
+        storage_info_t *s_info = &sw_info->storage_info;
+        s_info->storage_fd = -1;
+        char *home_path = getenv("HOME");
+        check(home_path != NULL && strlen(home_path) + 20 < sizeof(*s_info));
+        sprintf(s_info->storage_path, "%s/.dw_store_%d", home_path, i);
+        s_info->use_odirect = input_args.use_odirect;
+        s_info->max_storage_size = input_args.max_storage_size;
+        s_info->storage_offset = 0;
+        s_info->storage_eof = 0;
+    }
+
+    storage_threads = 0; // will be updated by argp parsing, which can specify multiple --storage options
+    parse_storage = 1; // allow parsing of --storage options only after the default storage path has been set (can be overridden by --storage)
+    argp_parse(&argp, argc, argv, ARGP_NO_HELP, 0, &input_args);
+    parse_storage = 0;
+
     // Handle SIGINT and SIGTERM via epoll
     sigset_t term_sigmask;
     sigemptyset(&term_sigmask);
@@ -1635,18 +1701,9 @@ int main(int argc, char *argv[]) {
 
     // Setup thread name
     sys_check(prctl(PR_GET_NAME, thread_name, NULL, NULL, NULL));
-    
+
     cpu_set_t mask;
     struct sockaddr_in serverAddr;
-
-    // Storage worker info defaults
-    storage_worker_info.timerfd = -1;
-    storage_worker_info.periodic_sync_msec = input_args.periodic_sync_msec;
-
-    storage_worker_info.storage_info.max_storage_size = input_args.max_storage_size;
-    storage_worker_info.storage_info.use_odirect = input_args.use_odirect;
-    storage_worker_info.storage_info.storage_offset = 0; //TODO: mutual exclusion here to avoid race conditions in per-client thread mode
-    storage_worker_info.storage_info.storage_eof = 0; //TODO: same here
 
     // Configure global variables
     conn_threads = input_args.num_threads;
@@ -1729,7 +1786,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Open storage file, if any
+    // Open storage file, if any 
     if (storage_worker_info.storage_info.storage_path[0] != '\0') {
         int flags = O_RDWR | O_CREAT | O_TRUNC;
         if (storage_worker_info.storage_info.use_odirect)
