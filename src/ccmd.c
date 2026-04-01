@@ -155,14 +155,14 @@ void ccmd_log(queue_t* q) {
 
         switch (curr->cmd) {
             case STORE:
-                sprintf(opts, "%sb,%s,offset=%s", pd_str(&curr->pd_val),
+                sprintf(opts, "dev=%d,%sb,%s,offset=%s", curr->store.dev_id, pd_str(&curr->pd_val),
                         curr->store.wait_sync ? "sync" : "nosync", pd_str(&curr->pd_val2));
                 break;
             case COMPUTE:
                 sprintf(opts, "%sus", pd_str(&curr->pd_val));
                 break;
             case LOAD:
-                sprintf(opts, "%sb,offset=%s", pd_str(&curr->pd_val),
+                sprintf(opts, "dev=%d,%sb,offset=%s", curr->load.dev_id, pd_str(&curr->pd_val),
                         pd_str(&curr->pd_val2));
                 break;
             case PSKIP:
